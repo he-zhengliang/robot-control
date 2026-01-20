@@ -2,20 +2,19 @@
 # -*- coding: utf-8 -*-
 
 import rospy
+import numpy as np
 import serial
 import time
-import numpy as np
-from threading import Lock
-
 from geometry_msgs.msg import PointStamped, PoseStamped
 import moveit_commander
 from tf.transformations import quaternion_from_euler, quaternion_matrix
+from threading import Lock
 
 # =========================================================
-# CONFIGURATION
+# CONFIG
 # =========================================================
 
-# -------- Serial ports --------
+# -------- Serial --------
 GRIPPER_PORT = "/dev/ttyACM0"
 GRIPPER_BAUD = 9600
 
@@ -23,11 +22,7 @@ TACTILE_PORT = "/dev/ttyACM1"
 TACTILE_BAUD = 250000
 
 # -------- Timing --------
-STABLE_SAMPLE_DELAY = 2.0     # seconds after grasp close
-REGRASP_Z_OFFSET = -0.005     # 5 mm downward
-
-# -------- Tactile --------
-NUM_CHANNELS = 12
+STABLE_SAMPLE_DELAY = 2.0   # seconds after close
 FORCE_THRESHOLD = 1.0
 
 # -------- Gripper commands --------
@@ -37,14 +32,14 @@ THUMB_OPEN_CMD  = 'AA 55 01 00 00 00 00 05 FF 03 FF 00 9F 02 9A'
 THUMB_CLOSE_CMD = 'AA 55 01 00 00 00 00 08 FF 05 96 00 90 01 F4'
 
 # =========================================================
-# GLOBAL SHARED POINT
+# SHARED TARGET POINT
 # =========================================================
 
 latest_point = None
 point_lock = Lock()
 
 # =========================================================
-# GRIPPER CONTROLLER
+# GRIPPER
 # =========================================================
 
 class GripperController:
@@ -53,29 +48,26 @@ class GripperController:
             self.ser = serial.Serial(port, baud, timeout=1)
             rospy.loginfo("[Gripper] Connected.")
         except serial.SerialException as e:
-            rospy.logerr(f"[Gripper] Connection failed: {e}")
+            rospy.logerr(e)
             self.ser = None
 
     def send_hex(self, cmd):
-        if not self.ser:
-            return
-        self.ser.write(bytearray.fromhex(cmd))
-        time.sleep(0.1)
+        if self.ser:
+            self.ser.write(bytearray.fromhex(cmd))
+            time.sleep(0.1)
 
     def close_hand(self):
-        rospy.loginfo("[Gripper] Closing hand")
         self.send_hex(CLOSE_CMD)
         time.sleep(0.2)
         self.send_hex(THUMB_CLOSE_CMD)
 
     def open_hand(self):
-        rospy.loginfo("[Gripper] Opening hand")
         self.send_hex(OPEN_CMD)
         time.sleep(0.2)
         self.send_hex(THUMB_OPEN_CMD)
 
 # =========================================================
-# TACTILE SENSOR INTERFACE
+# TACTILE
 # =========================================================
 
 class TactileReader:
@@ -84,106 +76,100 @@ class TactileReader:
             self.ser = serial.Serial(port, baud, timeout=1)
             rospy.loginfo("[Tactile] Connected.")
         except serial.SerialException as e:
-            rospy.logerr(f"[Tactile] Connection failed: {e}")
+            rospy.logerr(e)
             self.ser = None
 
     def read_one_sample(self):
-        """
-        Expected Arduino line format:
-        c1,c2,c3,...,c12\n
-        """
         if not self.ser:
             return None
 
         while True:
-            line = self.ser.readline().decode(errors='ignore').strip()
-            parts = line.split(',')
-            if len(parts) == NUM_CHANNELS:
+            line = self.ser.readline().decode(errors="ignore").strip()
+            vals = line.split(",")
+            if len(vals) == 12:
                 try:
-                    return np.array(parts, dtype=float)
+                    return np.array(vals, dtype=float)
                 except ValueError:
-                    continue
+                    pass
 
 # =========================================================
-# COP + GRASP QUALITY
+# COP + QUALITY
 # =========================================================
 
-def compute_cop_and_class(forces):
+def compute_grasp_quality(forces):
     """
-    forces: (12,) array
-    return: list of 3 class labels
+    forces: shape (12,)
+    returns True if grasp is acceptable
     """
 
-    # Annulus geometry
-    Ro, Ri = 5.0, 2.0
-    rc = (2/3) * (Ro**3 - Ri**3) / (Ro**2 - Ri**2)
-
-    # Electrode angles
-    theta = np.deg2rad([180, 270, 0, 90])  # unit 1 at -x, unit 3 at +x
+    # Geometry
+    theta = np.deg2rad([180, 270, 0, 90])   # unit1=-x, unit3=+x
+    rc = 4.0
     xs = rc * np.cos(theta)
     ys = rc * np.sin(theta)
 
-    classes = []
+    good_fingers = 0
 
-    for finger in range(3):
-        seg = forces[finger*4:(finger+1)*4]
+    for f in range(3):
+        seg = forces[f*4:(f+1)*4]
         fsum = np.sum(seg)
 
         if fsum < FORCE_THRESHOLD:
-            classes.append(2)
             continue
 
         xcop = np.sum(seg * xs) / fsum
         ycop = np.sum(seg * ys) / fsum
         r = np.sqrt(xcop**2 + ycop**2)
 
-        if r <= 0.5:
-            classes.append(0)
-        elif r <= 1.5:
-            classes.append(1)
-        else:
-            classes.append(2)
+        if r < 1.5:
+            good_fingers += 1
 
-    return classes
-
-def grasp_is_good(classes):
-    """
-    At least 2 fingers are class 0 or 1
-    """
-    good = sum(c <= 1 for c in classes)
-    return good >= 2
+    return good_fingers >= 2
 
 # =========================================================
 # ROS CALLBACK
 # =========================================================
 
-def point_callback(msg):
+def target_callback(msg):
     global latest_point
     with point_lock:
         latest_point = msg
 
 # =========================================================
-# MOTION HELPERS
+# MOTION HELPERS (UNCHANGED)
 # =========================================================
 
-def create_pose(point, dz=0.0):
+def create_pose(point_msg, offset_front=0.0, offset_lr=0.0, offset_tool=-0.1):
     q = quaternion_from_euler(0, np.pi/2, 0)
+
+    tool_offset = np.array([0.0, offset_lr, offset_tool, 1.0])
+    T = quaternion_matrix(q)
+    offset = T @ tool_offset
+
     pose = PoseStamped()
     pose.header.frame_id = "base"
     pose.pose.orientation.x = q[0]
     pose.pose.orientation.y = q[1]
     pose.pose.orientation.z = q[2]
     pose.pose.orientation.w = q[3]
-    pose.pose.position.x = point.point.x
-    pose.pose.position.y = point.point.y
-    pose.pose.position.z = point.point.z + dz
+
+    pose.pose.position.x = point_msg.point.x + offset[0] + offset_front
+    pose.pose.position.y = point_msg.point.y + offset[1]
+    pose.pose.position.z = point_msg.point.z + offset[2]
     return pose
 
-def move_to(group, pose):
+def move_to_pose(group, pose):
     group.set_pose_target(pose)
     ok = group.go(wait=True)
     group.stop()
     group.clear_pose_targets()
+    return ok
+
+def return_home(group):
+    home = [0, 0, 0, 0, 0, 0]
+    group.set_joint_value_target(home)
+    ok = group.go(wait=True)
+    group.stop()
     return ok
 
 # =========================================================
@@ -199,7 +185,7 @@ def main():
     gripper = GripperController(GRIPPER_PORT, GRIPPER_BAUD)
     tactile = TactileReader(TACTILE_PORT, TACTILE_BAUD)
 
-    rospy.Subscriber("/detected_point_base", PointStamped, point_callback)
+    rospy.Subscriber("/detected_point_base", PointStamped, target_callback)
 
     rate = rospy.Rate(2)
     last_stamp = None
@@ -212,39 +198,63 @@ def main():
         if target and target.header.stamp != last_stamp:
             last_stamp = target.header.stamp
 
-            rospy.loginfo("[Main] Moving to target")
-            pose = create_pose(target)
-            if not move_to(group, pose):
+            # -------------------------------------------------
+            # STEP 1: APPROACH
+            approach_pose = create_pose(target, offset_front=-0.20, offset_lr=-0.08)
+            if not move_to_pose(group, approach_pose):
                 continue
 
-            # ---------------- GRASP ----------------
+            # -------------------------------------------------
+            # STEP 2: TARGET
+            target_pose = create_pose(target, offset_front=0.025, offset_lr=0.015)
+            if not move_to_pose(group, target_pose):
+                continue
+
+            # -------------------------------------------------
+            # STEP 3: GRASP
             gripper.close_hand()
             rospy.sleep(STABLE_SAMPLE_DELAY)
 
-            # -------- READ ONE STABLE SAMPLE --------
             forces = tactile.read_one_sample()
             if forces is None:
                 rospy.logwarn("[Tactile] No data")
                 gripper.open_hand()
                 continue
 
-            classes = compute_cop_and_class(forces)
-            rospy.loginfo(f"[Tactile] Finger classes: {classes}")
+            good = compute_grasp_quality(forces)
+            rospy.loginfo(f"[Tactile] Grasp quality: {good}")
 
-            # -------- DECISION --------
-            if grasp_is_good(classes):
-                rospy.loginfo("[Decision] Good grasp → detach apple")
-                # Detach / pull logic here
-            else:
-                rospy.logwarn("[Decision] Bad grasp → regrasp")
+            # -------------------------------------------------
+            # STEP 4: RETREAT
+            move_to_pose(group, approach_pose)
+
+            # -------------------------------------------------
+            # STEP 5: PLACE OR REGRASP
+            if good:
+                rospy.loginfo("[Decision] Good grasp")
+
+                place_pose = PoseStamped()
+                place_pose.header.frame_id = "base"
+                q = quaternion_from_euler(0, np.pi/2, 0)
+                place_pose.pose.orientation.x = q[0]
+                place_pose.pose.orientation.y = q[1]
+                place_pose.pose.orientation.z = q[2]
+                place_pose.pose.orientation.w = q[3]
+                place_pose.pose.position.x = 0.65
+                place_pose.pose.position.y = 0.41
+                place_pose.pose.position.z = 0.22
+
+                move_to_pose(group, place_pose)
                 gripper.open_hand()
-                rospy.sleep(0.5)
 
-                regrasp_pose = create_pose(target, dz=REGRASP_Z_OFFSET)
-                move_to(group, regrasp_pose)
+            else:
+                rospy.logwarn("[Decision] Bad grasp → release")
+                gripper.open_hand()
 
-                gripper.close_hand()
-                rospy.sleep(STABLE_SAMPLE_DELAY)
+            # -------------------------------------------------
+            # STEP 6: HOME
+            return_home(group)
+            rospy.sleep(2)
 
         rate.sleep()
 
