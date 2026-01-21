@@ -262,3 +262,39 @@ def update_viz(frame):
 
 ani = FuncAnimation(fig, update_viz, interval=50, cache_frame_data=False)
 plt.show()
+
+def update_viz(frame):
+    # 1. Get the latest snapshot from the background thread
+    forces, hx, hy, pred = tactile.get_data()
+    status_text.set_text(f"Grasp Prediction: {pred}")
+
+    for s in range(3):
+        seg = forces[s*4 : (s+1)*4]
+        f_sum = np.sum(seg)
+        
+        # Only update trajectory if there is actual pressure
+        if f_sum > FORCE_THRESHOLD:
+            xc = np.sum(seg * tactile.xs) / f_sum
+            yc = np.sum(seg * tactile.ys) / f_sum
+            r = np.sqrt(xc**2 + yc**2)
+            
+            # Update History (This is the trajectory data)
+            hx[s].append(xc)
+            hy[s].append(yc)
+            
+            # Limit history size to 100 points to prevent lag
+            if len(hx[s]) > 100:
+                hx[s].pop(0)
+                hy[s].pop(0)
+            
+            # UPDATE PLOT OBJECTS
+            h_cops[s].set_offsets([[xc, yc]])
+            
+            # Update the line (The trajectory)
+            trajectories[s].set_data(hx[s], hy[s])
+            
+            # Change color based on current radius
+            clr = COLOR_0 if r <= 0.5 else COLOR_1 if r <= 1.5 else COLOR_2
+            h_cops[s].set_facecolor(clr)
+            trajectories[s].set_color(clr) # Makes the line match the dot color
+            trajectories[s].set_linewidth(2) # Ensure it's thick enough to see
