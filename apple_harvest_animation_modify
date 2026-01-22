@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import rospy
+import numpy as np
+import serial
+import time
+import threading
+from geometry_msgs.msg import PointStamped, PoseStamped
+import moveit_commander
+from tf.transformations import quaternion_from_euler, quaternion_matrix
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from matplotlib.collections import LineCollection
+
+# =========================================================
+# CONFIGURATION
+# =========================================================
+GRIPPER_PORT = "/dev/ttyACM0"
+GRIPPER_BAUD = 9600
+TACTILE_PORT = "/dev/ttyACM1"
+TACTILE_BAUD = 250000
+
+FORCE_THRESHOLD = 0.5   # Adjusted for better sensitivity
+STABLE_SAMPLE_DELAY = 2.0
+CHANNELS = 12
+TRAJECTORY_LEN = 40     # Length of the "ghost" tail
+
+# Colors
+COLOR_0 = (0, 0.7, 0)      # Green (Center)
+COLOR_1 = (0.9, 0.7, 0)    # Yellow (Mid)
+COLOR_2 = (0.9, 0, 0)      # Red (Edge)
+
+# =========================================================
+# TACTILE SYSTEM (OPTIMIZED)
+# =========================================================
+
+class TactileSystem:
+    def __init__(self, port, baud):
+        self.lock = threading.Lock()
+        self.current_forces = np.zeros(CHANNELS)
+        self.history_x = [[] for _ in range(3)]
+        self.history_y = [[] for _ in range(3)]
+        self.grasp_prediction = "IDLE"
+        
+        # Geometry
+        self.Ro, self.Ri = 5.0, 2.0
+        self.rc = (2/3) * (self.Ro**3 - self.Ri**3) / (self.Ro**2 - self.Ri**2)
+        self.theta = np.deg2rad([0, 90, 180, 270])
+        self.xs = self.rc * np.cos(self.theta)
+        self.ys = self.rc * np.sin(self.theta)
+
+        try:
+            self.ser = serial.Serial(port, baud, timeout=0.01) # Low timeout for speed
+            rospy.loginfo("[Tactile] Serial Connected.")
+        except Exception as e:
+            rospy.logerr(f"[Tactile] Connection Failed: {e}")
+            self.ser = None
+
+        self.running = True
+        self.thread = threading.Thread(target=self._update_loop)
+        self.thread.daemon = True
+        self.thread.start()
+
+    def _update_loop(self):
+        while self.running and not rospy.is_shutdown():
+            if self.ser and self.ser.in_waiting > 0:
+                # PERFORMANCE MOD 1: Flush buffer if it builds up (prevents lag)
+                if self.ser.in_waiting > 1000:
+                    self.ser.reset_input_buffer()
+                
+                line = self.ser.readline().decode(errors="ignore").strip()
+                values = line.split(",")
+                if len(values) >= CHANNELS + 1:
+                    try:
+                        floats = list(map(float, values[1:1 + CHANNELS]))
+                        with self.lock:
+                            self.current_forces = np.array(floats)
+                    except ValueError:
+                        pass
+
+    def get_data(self):
+        with self.lock:
+            return self.current_forces.copy(), self.history_x, self.history_y, self.grasp_prediction
+
+    def set_prediction(self, status):
+        with self.lock:
+            self.grasp_prediction = status
+
+    def reset_history(self):
+        with self.lock:
+            self.history_x = [[] for _ in range(3)]
+            self.history_y = [[] for _ in range(3)]
+
+# =========================================================
+# ROBOT CONTROL
+# =========================================================
+
+class ApplePicker:
+    def __init__(self, tactile_sys):
+        rospy.init_node("apple_grasp_tactile_integrated")
+        moveit_commander.roscpp_initialize([])
+        self.group = moveit_commander.MoveGroupCommander("manipulator")
+        self.tactile = tactile_sys
+        
+        try:
+            self.gripper_ser = serial.Serial(GRIPPER_PORT, GRIPPER_BAUD, timeout=1)
+        except:
+            self.gripper_ser = None
+
+        self.latest_point = None
+        self.last_processed_stamp = None
+        rospy.Subscriber("/detected_point_base", PointStamped, self.target_callback)
+
+    def target_callback(self, msg):
+        self.latest_point = msg
+
+    def send_gripper(self, cmd):
+        if self.gripper_ser:
+            self.gripper_ser.write(bytearray.fromhex(cmd))
+            time.sleep(0.1)
+
+    def run_state_machine(self):
+        if self.latest_point is None or self.latest_point.header.stamp == self.last_processed_stamp:
+            return
+
+        target = self.latest_point
+        self.last_processed_stamp = target.header.stamp
+        self.tactile.reset_history()
+
+        p_app = self.create_pose(target, -0.20, -0.08)
+        p_tar = self.create_pose(target, 0.025, 0.015)
+        
+        if self.move_to(p_app) and self.move_to(p_tar):
+            self.send_gripper('AA 55 00 01 01 01 01 08 FF 03 E9 01 20 01 3D')
+            time.sleep(0.2)
+            self.send_gripper('AA 55 01 00 00 00 00 08 FF 05 96 00 90 01 F4')
+            rospy.sleep(STABLE_SAMPLE_DELAY)
+
+            forces, _, _, _ = self.tactile.get_data()
+            is_good = self.predict_status(forces)
+
+            if is_good:
+                self.tactile.set_prediction("STABLE GRASP - PROCEEDING")
+                self.move_to(p_app) 
+                self.place()
+            else:
+                self.tactile.set_prediction("BAD GRASP - REGRIP")
+                self.send_gripper('AA 55 00 01 01 01 01 05 FF 03 FF 01 2F 02 2A')
+            
+            self.return_home()
+            self.tactile.set_prediction("IDLE")
+
+    def predict_status(self, forces):
+        hits = 0
+        for i in range(3):
+            seg = forces[i*4:(i+1)*4]
+            f_sum = np.sum(seg)
+            if f_sum > FORCE_THRESHOLD:
+                xc = np.sum(seg * self.tactile.xs) / f_sum
+                yc = np.sum(seg * self.tactile.ys) / f_sum
+                if np.sqrt(xc**2 + yc**2) < 1.5: hits += 1
+        return hits >= 2
+
+    def create_pose(self, point_msg, off_f, off_lr):
+        q = quaternion_from_euler(0, np.pi/2, 0)
+        T = quaternion_matrix(q)
+        offset = T @ np.array([0.0, off_lr, -0.1, 1.0])
+        p = PoseStamped()
+        p.header.frame_id = "base"
+        p.pose.orientation.x, p.pose.orientation.y, p.pose.orientation.z, p.pose.orientation.w = q
+        p.pose.position.x = point_msg.point.x + offset[0] + off_f
+        p.pose.position.y = point_msg.point.y + offset[1]
+        p.pose.position.z = point_msg.point.z + offset[2]
+        return p
+
+    def move_to(self, pose):
+        self.group.set_pose_target(pose)
+        return self.group.go(wait=True)
+
+    def place(self):
+        p = PoseStamped()
+        p.header.frame_id = "base"
+        q = quaternion_from_euler(0, np.pi/2, 0)
+        p.pose.orientation.x, p.pose.orientation.y, p.pose.orientation.z, p.pose.orientation.w = q
+        p.pose.position.x, p.pose.position.y, p.pose.position.z = 0.65, 0.41, 0.22
+        self.move_to(p)
+        self.send_gripper('AA 55 00 01 01 01 01 05 FF 03 FF 01 2F 02 2A')
+
+    def return_home(self):
+        self.group.set_joint_value_target([0,0,0,0,0,0])
+        self.group.go(wait=True)
+
+# =========================================================
+# VISUALIZATION (GHOSTING & SPEED MODS)
+# =========================================================
+
+tactile = TactileSystem(TACTILE_PORT, TACTILE_BAUD)
+picker = ApplePicker(tactile)
+
+fig, axs = plt.subplots(1, 3, figsize=(15, 6), facecolor='white')
+plt.subplots_adjust(bottom=0.2)
+sensor_names = ['Index Finger', 'Middle Finger', 'Ring Finger']
+h_cops = []
+ghost_lines = [] # PERFORMANCE MOD: Using LineCollections for ghosting
+circle_t = np.linspace(0, 2*np.pi, 200)
+
+status_text = fig.text(0.5, 0.05, 'Status: IDLE', ha='center', fontsize=14, fontweight='bold', color='blue')
+
+for i, ax in enumerate(axs):
+    ax.set_xlim(-6, 6); ax.set_ylim(-6, 6); ax.set_aspect('equal')
+    ax.plot(tactile.Ro*np.cos(circle_t), tactile.Ro*np.sin(circle_t), 'k', lw=1.5)
+    ax.plot(tactile.Ri*np.cos(circle_t), tactile.Ri*np.sin(circle_t), 'k', lw=1.5)
+    ax.axhline(0, color='gray', ls='--', lw=0.5); ax.axvline(0, color='gray', ls='--', lw=0.5)
+    ax.scatter(tactile.xs, tactile.ys, color='black', s=80, zorder=3)
+    ax.set_title(sensor_names[i])
+    
+    # LineCollection allows each segment of the line to have a different alpha (ghosting)
+    lc = LineCollection([], linewidths=3, zorder=4)
+    ax.add_collection(lc)
+    ghost_lines.append(lc)
+    
+    scat = ax.scatter([], [], s=180, edgecolors='black', zorder=5)
+    h_cops.append(scat)
+
+def update_viz(frame):
+    forces, hx, hy, pred = tactile.get_data()
+    status_text.set_text(f"Grasp Prediction: {pred}")
+
+    for s in range(3):
+        seg = forces[s*4 : (s+1)*4]
+        f_sum = np.sum(seg)
+        
+        if f_sum > FORCE_THRESHOLD:
+            xc = np.sum(seg * tactile.xs) / f_sum
+            yc = np.sum(seg * tactile.ys) / f_sum
+            r = np.sqrt(xc**2 + yc**2)
+            
+            # PERFORMANCE MOD 3: Limit History for speed
+            hx[s].append(xc)
+            hy[s].append(yc)
+            if len(hx[s]) > TRAJECTORY_LEN:
+                hx[s].pop(0); hy[s].pop(0)
+            
+            # GHOSTING EFFECT MOD:
+            if len(hx[s]) > 2:
+                points = np.array([hx[s], hy[s]]).T.reshape(-1, 1, 2)
+                segments = np.concatenate([points[:-1], points[1:]], axis=1)
+                
+                # Create alpha gradient (fading out older segments)
+                n_seg = len(segments)
+                alphas = np.linspace(0.1, 0.9, n_seg)
+                clr = COLOR_0 if r <= 0.5 else COLOR_1 if r <= 1.5 else COLOR_2
+                
+                # Apply colors and alphas
+                rgba_colors = np.zeros((n_seg, 4))
+                rgba_colors[:, :3] = clr # RGB
+                rgba_colors[:, 3] = alphas # Alpha
+                
+                ghost_lines[s].set_segments(segments)
+                ghost_lines[s].set_colors(rgba_colors)
+            
+            h_cops[s].set_offsets([[xc, yc]])
+            h_cops[s].set_facecolor(clr)
+            
+    if not rospy.is_shutdown():
+        if not hasattr(update_viz, "robot_thread") or not update_viz.robot_thread.is_alive():
+            update_viz.robot_thread = threading.Thread(target=picker.run_state_machine)
+            update_viz.robot_thread.start()
+
+# PERFORMANCE MOD 2: Interval=30 for ~33 FPS refresh rate
+ani = FuncAnimation(fig, update_viz, interval=30, cache_frame_data=False)
+plt.show()
