@@ -20,10 +20,14 @@ GRIPPER_BAUD = 9600
 TACTILE_PORT = "/dev/ttyACM1"
 TACTILE_BAUD = 250000
 
-# Since values are normalized, 0.5 is a safe threshold to ignore noise
 FORCE_THRESHOLD = 0.5  
-TAIL_LENGTH = 25       # Length of the ghosting effect
+TAIL_LENGTH = 25       
 CHANNELS = 12
+
+# Colors (RGB)
+COLOR_GREEN = (0, 0.7, 0)
+COLOR_RED   = (0.9, 0, 0)
+COLOR_IDLE  = (0.7, 0.7, 0.7) # Gray
 
 # =========================================================
 # TACTILE DATA ENGINE
@@ -33,9 +37,8 @@ class TactileSystem:
     def __init__(self, port, baud):
         self.lock = threading.Lock()
         self.current_forces = np.zeros(CHANNELS)
-        self.grasp_prediction = "IDLE"
         
-        # Sensor Geometry
+        # Sensor Geometry: Ro=5.0, Ri=2.0
         self.Ro, self.Ri = 5.0, 2.0
         self.rc = (2/3) * (self.Ro**3 - self.Ri**3) / (self.Ro**2 - self.Ri**2)
         theta_deg = [0, 90, 180, 270]
@@ -48,10 +51,9 @@ class TactileSystem:
 
         try:
             self.ser = serial.Serial(port, baud, timeout=0.1)
-            rospy.loginfo("[Tactile] Connected to Arduino.")
+            rospy.loginfo("[Tactile] Connected.")
         except:
             self.ser = None
-            rospy.logerr("[Tactile] Failed to connect.")
 
         self.thread = threading.Thread(target=self._update_loop)
         self.thread.daemon = True
@@ -62,22 +64,21 @@ class TactileSystem:
             if self.ser and self.ser.in_waiting > 0:
                 line = self.ser.readline().decode(errors="ignore").strip()
                 values = line.split(",")
-                # Format: timestamp, c1, c2, ... c12
                 if len(values) >= 13:
                     try:
-                        # Extract ONLY the 12 normalized capacitance values
+                        # Extract 12 normalized capacitance values (c1-c12)
                         floats = [float(x) for x in values[1:13]]
                         with self.lock:
                             self.current_forces = np.array(floats)
-                    except ValueError:
+                    except:
                         continue
 
     def get_data(self):
         with self.lock:
-            return self.current_forces.copy(), self.history_x, self.history_y, self.grasp_prediction
+            return self.current_forces.copy(), self.history_x, self.history_y
 
 # =========================================================
-# ROBOT & VISUALIZATION LOGIC
+# ANIMATION & COLOR LOGIC
 # =========================================================
 
 tactile = TactileSystem(TACTILE_PORT, TACTILE_BAUD)
@@ -89,27 +90,25 @@ circle_t = np.linspace(0, 2*np.pi, 200)
 
 for i, ax in enumerate(axs):
     ax.set_xlim(-6, 6); ax.set_ylim(-6, 6); ax.set_aspect('equal')
-    # Draw Sensor Board Geometry
-    ax.plot(tactile.Ro*np.cos(circle_t), tactile.Ro*np.sin(circle_t), 'k', lw=1.2)
-    ax.plot(tactile.Ri*np.cos(circle_t), tactile.Ri*np.sin(circle_t), 'k', lw=1.2)
-    ax.scatter(tactile.xs, tactile.ys, color='black', s=40, alpha=0.5)
+    # Draw Sensor Board
+    ax.plot(tactile.Ro*np.cos(circle_t), tactile.Ro*np.sin(circle_t), 'k', lw=1.5)
+    ax.plot(tactile.Ri*np.cos(circle_t), tactile.Ri*np.sin(circle_t), 'k', lw=1.5)
     ax.set_title(sensor_names[i])
     
-    # Visual Objects
     line, = ax.plot([], [], lw=2, alpha=0.6)
-    dot = ax.scatter([0], [0], s=120, edgecolors='black', zorder=5) # Initial center dot
+    dot = ax.scatter([0], [0], s=130, edgecolors='black', zorder=5) 
     h_tails.append(line)
     h_cops.append(dot)
 
 def update(frame):
-    forces, hx, hy, pred = tactile.get_data()
+    forces, hx, hy = tactile.get_data()
     
     for s in range(3):
         f_segment = forces[s*4 : (s+1)*4]
         f_sum = np.sum(f_segment)
         
         if f_sum > FORCE_THRESHOLD:
-            # --- CONTACT STATE ---
+            # --- ACTIVE CONTACT ---
             xc = np.sum(f_segment * tactile.xs) / f_sum
             yc = np.sum(f_segment * tactile.ys) / f_sum
             
@@ -121,30 +120,23 @@ def update(frame):
             h_tails[s].set_data(hx[s], hy[s])
             h_cops[s].set_offsets([[xc, yc]])
             
-            # Color by quality (Radius < 1.5 is green)
+            # Distance from center
             r = np.sqrt(xc**2 + yc**2)
-            clr = (0, 0.7, 0) if r <= 1.5 else (0.9, 0, 0)
-            h_cops[s].set_facecolor(clr)
-            h_tails[s].set_color(clr)
+            
+            # Logic: Center is GREEN, Edge is RED
+            current_color = COLOR_GREEN if r <= 1.5 else COLOR_RED
+            h_cops[s].set_facecolor(current_color)
+            h_tails[s].set_color(current_color)
             
         else:
-            # --- IDLE STATE (CENTER ON ZERO) ---
+            # --- IDLE STATE ---
             h_cops[s].set_offsets([[0, 0]])
-            h_cops[s].set_facecolor((0.7, 0.7, 0.7)) # Neutral Gray
-            
-            # Clear history so no "old" trail lingers
+            h_cops[s].set_facecolor(COLOR_IDLE)
             hx[s].clear()
             hy[s].clear()
             h_tails[s].set_data([], [])
 
     return h_cops + h_tails
-
-# =========================================================
-# NEXT STEP
-# =========================================================
-# This script currently focuses on the visualization stability. 
-# Once you verify the COP stays centered at (0,0) and moves correctly 
-# upon touch, we can re-insert the MoveIt robot control class.
 
 ani = FuncAnimation(fig, update, interval=50, blit=True)
 plt.tight_layout()
