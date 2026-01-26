@@ -42,7 +42,10 @@ class TactileSystem:
         # Geometry
         self.Ro, self.Ri = 5.0, 2.0
         self.rc = (2/3) * (self.Ro**3 - self.Ri**3) / (self.Ro**2 - self.Ri**2)
-        self.theta = np.deg2rad([0, 90, 180, 270])
+        
+        # SWAP: Unit 1 (index 0) and Unit 3 (index 2)
+        # Original: [0, 90, 180, 270] -> Modified: [180, 90, 0, 270]
+        self.theta = np.deg2rad([180, 90, 0, 270])
         self.xs = self.rc * np.cos(self.theta)
         self.ys = self.rc * np.sin(self.theta)
 
@@ -115,12 +118,10 @@ class ApplePicker:
         self.last_processed_stamp = target.header.stamp
         self.tactile.set_prediction("MONITORING")
 
-        # STEP 1: APPROACH
         p_app = self.create_pose(target, -0.20, -0.08)
         p_tar = self.create_pose(target, 0.025, 0.015)
         
         if self.move_to(p_app) and self.move_to(p_tar):
-            # STEP 2: GRASP
             rospy.loginfo("Closing Gripper...")
             self.send_gripper('AA 55 00 01 01 01 01 08 FF 03 E9 01 20 01 3D')
             time.sleep(0.2)
@@ -128,7 +129,6 @@ class ApplePicker:
             
             rospy.sleep(STABLE_SAMPLE_DELAY)
 
-            # STEP 3: PREDICTION
             forces, _ = self.tactile.get_data()
             is_good = self.predict_status(forces)
 
@@ -202,16 +202,15 @@ status_text = fig.text(0.5, 0.05, 'Status: IDLE', ha='center', fontsize=14, font
 
 for i, ax in enumerate(axs):
     ax.set_xlim(-6, 6); ax.set_ylim(-6, 6); ax.set_aspect('equal')
-    # Draw sensor concentric circles
     ax.plot(tactile.Ro*np.cos(circle_t), tactile.Ro*np.sin(circle_t), 'k', lw=1.5)
     ax.plot(tactile.Ri*np.cos(circle_t), tactile.Ri*np.sin(circle_t), 'k', lw=1.5)
     ax.axhline(0, color='gray', ls='--', lw=0.5); ax.axvline(0, color='gray', ls='--', lw=0.5)
     
-    # Electrode positions
+    # Electrode visualization (Alpha 0.3 to keep it clean)
     ax.scatter(tactile.xs, tactile.ys, color='black', s=80, zorder=3, alpha=0.3)
     ax.set_title(sensor_names[i])
     
-    # Real-time COP point (No trajectory lines)
+    # Real-time COP marker
     scat = ax.scatter([], [], s=200, edgecolors='black', zorder=5)
     h_cops.append(scat)
 
@@ -234,13 +233,11 @@ def update_viz(frame):
             
             clr = COLOR_0 if r <= 0.5 else COLOR_1 if r <= 1.5 else COLOR_2
             
-            # Update position and make visible
             h_cops[s].set_offsets([[xc, yc]])
             h_cops[s].set_facecolor(clr)
             h_cops[s].set_alpha(1.0)
         else:
-            # Hide the point if no contact
-            h_cops[s].set_alpha(0.0)
+            h_cops[s].set_alpha(0.0) # Hide marker if no force
             
     if not rospy.is_shutdown():
         if not hasattr(update_viz, "robot_thread") or not update_viz.robot_thread.is_alive():
