@@ -21,15 +21,20 @@ TACTILE_PORT = "/dev/ttyACM1"
 TACTILE_BAUD = 250000
 
 # Grasping Logic Thresholds
-FORCE_THRESHOLD = 1.0       # Noise floor for COP calculation
-MIN_GRASP_FORCE = 1.5       # Target force for a secure grip (Newtons)
+FORCE_THRESHOLD = 1.0       
+MIN_GRASP_FORCE = 1.5       
 STABLE_SAMPLE_DELAY = 2.0
 CHANNELS = 12
+
+# HEX COMMANDS
+CMD_FINGERS_CLOSE = 'AA 55 00 01 01 01 01 08 FF 03 E9 01 20 01 3D' # Close 4 fingers
+CMD_THUMB_CLOSE   = 'AA 55 01 00 00 00 00 08 FF 05 96 00 90 01 F4' # Close Thumb
+CMD_OPEN_ALL      = 'AA 55 00 01 01 01 01 05 FF 03 FF 01 2F 02 2A' # Open all
 
 # Mapping: 0-100 capacitance -> 0-3N Force
 FORCE_CONVERSION = 3.0 / 100.0
 
-# Colors
+# Colors for Visualization
 COLOR_0 = (0, 0.7, 0)      # Green (Center)
 COLOR_1 = (0.9, 0.7, 0)    # Yellow (Mid)
 COLOR_2 = (0.9, 0, 0)      # Red (Edge)
@@ -44,11 +49,9 @@ class TactileSystem:
         self.current_forces = np.zeros(CHANNELS)
         self.grasp_prediction = "IDLE"
         
-        # Geometry
         self.Ro, self.Ri = 5.0, 2.0
         self.rc = (2/3) * (self.Ro**3 - self.Ri**3) / (self.Ro**2 - self.Ri**2)
         
-        # SWAP: Unit 1 and Unit 3 for physical alignment
         self.theta = np.deg2rad([180, 90, 0, 270])
         self.xs = self.rc * np.cos(self.theta)
         self.ys = self.rc * np.sin(self.theta)
@@ -72,7 +75,6 @@ class TactileSystem:
                 values = line.split(",")
                 if len(values) >= CHANNELS + 1:
                     try:
-                        # Map raw data to Newtons immediately
                         floats = [float(v) * FORCE_CONVERSION for v in values[1:1 + CHANNELS]]
                         with self.lock:
                             self.current_forces = np.array(floats)
@@ -123,28 +125,51 @@ class ApplePicker:
         self.last_processed_stamp = target.header.stamp
         self.tactile.set_prediction("MONITORING")
 
-        p_app = self.create_pose(target, -0.20, -0.08)
-        p_tar = self.create_pose(target, 0.025, 0.015)
-        
-        if self.move_to(p_app) and self.move_to(p_tar):
-            rospy.loginfo("Closing Gripper...")
-            self.send_gripper('AA 55 00 01 01 01 01 08 FF 03 E9 01 20 01 3D')
+        # Pose Setup
+        p_app = self.create_pose(target, -0.20, -0.08) # Pos 1 & 3
+        p_tar = self.create_pose(target, 0.025, 0.015) # Pos 2
+
+        # 1. Approach
+        rospy.loginfo("Pos 1: Moving to Approach")
+        if not self.move_to(p_app): return
+
+        # 2. Target & Grasp
+        rospy.loginfo("Pos 2: Moving to Target")
+        if self.move_to(p_tar):
+            # Combined Grasp: Fingers then Thumb
+            self.send_gripper(CMD_FINGERS_CLOSE)
             time.sleep(0.2)
-            self.send_gripper('AA 55 01 00 00 00 00 08 FF 05 96 00 90 01 F4')
+            self.send_gripper(CMD_THUMB_CLOSE)
             
             rospy.sleep(STABLE_SAMPLE_DELAY)
 
             forces, _ = self.tactile.get_data()
-            is_good = self.predict_status(forces)
-
-            if is_good:
-                self.tactile.set_prediction("STABLE GRASP - PROCEEDING")
+            if self.predict_status(forces):
+                self.tactile.set_prediction("STABLE - DETACHING")
+                
+                # 3. Detach (Retract back to Approach point)
+                rospy.loginfo("Pos 3: Detaching")
                 self.move_to(p_app) 
-                self.place()
+
+                # 4. Bucket
+                rospy.loginfo("Pos 4: Moving to Bucket")
+                self.move_to_bucket()
+                self.send_gripper(CMD_OPEN_ALL)
+                time.sleep(1.0)
+
+                # 5. Transit
+                rospy.loginfo("Pos 5: Moving to Transit")
+                self.move_to_transit()
             else:
-                self.tactile.set_prediction("BAD GRASP - REGRIP REQUIRED")
-                self.send_gripper('AA 55 00 01 01 01 01 05 FF 03 FF 01 2F 02 2A') 
+                # SAFETY RETRACTION
+                self.tactile.set_prediction("BAD GRASP - RECOVERING")
+                rospy.loginfo("Grasp failed. Releasing and retracting...")
+                self.send_gripper(CMD_OPEN_ALL) 
+                time.sleep(0.5)
+                self.move_to(p_app) # Retreat to Pos 1
             
+            # 6. Home
+            rospy.loginfo("Pos 6: Returning Home")
             self.return_home()
             self.tactile.set_prediction("IDLE")
 
@@ -153,7 +178,6 @@ class ApplePicker:
         for i in range(3):
             seg = forces[i*4:(i+1)*4]
             f_sum = np.sum(seg)
-            # DUAL CRITERION: Force must be > 1.5N AND COP must be centered
             if f_sum >= MIN_GRASP_FORCE:
                 xc = np.sum(seg * self.tactile.xs) / f_sum
                 yc = np.sum(seg * self.tactile.ys) / f_sum
@@ -178,17 +202,27 @@ class ApplePicker:
         self.group.set_pose_target(pose)
         return self.group.go(wait=True)
 
-    def place(self):
+    def move_to_bucket(self):
+        """Position 4: Fixed Bucket Pose"""
         p = PoseStamped()
         p.header.frame_id = "base"
         q = quaternion_from_euler(0, np.pi/2, 0)
         p.pose.orientation.x, p.pose.orientation.y, p.pose.orientation.z, p.pose.orientation.w = q
         p.pose.position.x, p.pose.position.y, p.pose.position.z = 0.65, 0.41, 0.22
-        self.move_to(p)
-        self.send_gripper('AA 55 00 01 01 01 01 05 FF 03 FF 01 2F 02 2A')
+        return self.move_to(p)
+
+    def move_to_transit(self):
+        """Position 5: Intermediate Transit Pose"""
+        p = PoseStamped()
+        p.header.frame_id = "base"
+        q = quaternion_from_euler(0, np.pi/2, 0)
+        p.pose.orientation.x, p.pose.orientation.y, p.pose.orientation.z, p.pose.orientation.w = q
+        p.pose.position.x, p.pose.position.y, p.pose.position.z = 0.50, 0.09, 0.30
+        return self.move_to(p)
 
     def return_home(self):
-        self.group.set_joint_value_target([0,0,0,0,0,0])
+        """Position 6: Home Joint Configuration"""
+        self.group.set_joint_value_target([0, 0, 0, 0, 0, 0])
         self.group.go(wait=True)
 
 # =========================================================
@@ -199,10 +233,9 @@ tactile = TactileSystem(TACTILE_PORT, TACTILE_BAUD)
 picker = ApplePicker(tactile)
 
 fig, axs = plt.subplots(1, 3, figsize=(15, 6), facecolor='white')
-plt.subplots_adjust(bottom=0.25) # Extra space for force labels
+plt.subplots_adjust(bottom=0.25)
 sensor_names = ['Index Finger', 'Middle Finger', 'Ring Finger']
-h_cops = []
-force_labels = [] # List to store text objects for force display
+h_cops, force_labels = [], []
 circle_t = np.linspace(0, 2*np.pi, 200)
 
 status_text = fig.text(0.5, 0.05, 'Status: IDLE', ha='center', fontsize=14, fontweight='bold', color='blue')
@@ -211,50 +244,27 @@ for i, ax in enumerate(axs):
     ax.set_xlim(-6, 6); ax.set_ylim(-6, 6); ax.set_aspect('equal')
     ax.plot(tactile.Ro*np.cos(circle_t), tactile.Ro*np.sin(circle_t), 'k', lw=1.5)
     ax.plot(tactile.Ri*np.cos(circle_t), tactile.Ri*np.sin(circle_t), 'k', lw=1.5)
-    ax.axhline(0, color='gray', ls='--', lw=0.5); ax.axvline(0, color='gray', ls='--', lw=0.5)
-    
-    ax.scatter(tactile.xs, tactile.ys, color='black', s=80, zorder=3, alpha=0.3)
-    ax.set_title(sensor_names[i])
-    
-    # Real-time COP marker
-    scat = ax.scatter([], [], s=200, edgecolors='black', zorder=5)
-    h_cops.append(scat)
-
-    # Force Label under each subplot
-    flbl = ax.text(0, -7.5, 'Force: 0.00N', ha='center', fontsize=12, fontweight='bold', color='red')
-    force_labels.append(flbl)
+    h_cops.append(ax.scatter([], [], s=200, edgecolors='black', zorder=5))
+    force_labels.append(ax.text(0, -7.5, 'Force: 0.00N', ha='center', fontsize=12, fontweight='bold'))
 
 def update_viz(frame):
     forces, pred = tactile.get_data()
     status_text.set_text(f"Grasp Prediction: {pred}")
-    
-    if "STABLE" in pred: status_text.set_color('green')
-    elif "BAD" in pred: status_text.set_color('red')
-    else: status_text.set_color('blue')
+    status_text.set_color('green' if "STABLE" in pred else 'red' if "BAD" in pred else 'blue')
 
     for s in range(3):
-        seg = forces[s*4 : (s+1)*4]
-        f_sum = np.sum(seg)
-        
-        # Update Force Label Text and Color
+        f_sum = np.sum(forces[s*4 : (s+1)*4])
         force_labels[s].set_text(f"Force: {f_sum:.2f}N")
-        if f_sum >= MIN_GRASP_FORCE:
-            force_labels[s].set_color('green')
-        else:
-            force_labels[s].set_color('red')
-
-        if f_sum > 0.05: # Visual noise floor
-            xc = np.sum(seg * tactile.xs) / f_sum
-            yc = np.sum(seg * tactile.ys) / f_sum
+        force_labels[s].set_color('green' if f_sum >= MIN_GRASP_FORCE else 'red')
+        if f_sum > 0.05:
+            xc = np.sum(forces[s*4:(s+1)*4] * tactile.xs) / f_sum
+            yc = np.sum(forces[s*4:(s+1)*4] * tactile.ys) / f_sum
             r = np.sqrt(xc**2 + yc**2)
-            
             clr = COLOR_0 if r <= 0.5 else COLOR_1 if r <= 1.5 else COLOR_2
-            
             h_cops[s].set_offsets([[xc, yc]])
             h_cops[s].set_facecolor(clr)
             h_cops[s].set_alpha(1.0)
-        else:
-            h_cops[s].set_alpha(0.0)
+        else: h_cops[s].set_alpha(0.0)
             
     if not rospy.is_shutdown():
         if not hasattr(update_viz, "robot_thread") or not update_viz.robot_thread.is_alive():
