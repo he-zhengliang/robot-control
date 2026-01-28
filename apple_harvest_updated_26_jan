@@ -21,8 +21,8 @@ TACTILE_PORT = "/dev/ttyACM1"
 TACTILE_BAUD = 250000
 
 # Grasping Logic Thresholds
-FORCE_THRESHOLD = 1.0       
-MIN_GRASP_FORCE = 1.5       
+FORCE_THRESHOLD = 0.5       
+MIN_GRASP_FORCE = 1.0       
 STABLE_SAMPLE_DELAY = 2.0
 CHANNELS = 12
 
@@ -260,7 +260,7 @@ def update_viz(frame):
             xc = np.sum(forces[s*4:(s+1)*4] * tactile.xs) / f_sum
             yc = np.sum(forces[s*4:(s+1)*4] * tactile.ys) / f_sum
             r = np.sqrt(xc**2 + yc**2)
-            clr = COLOR_0 if r <= 0.5 else COLOR_1 if r <= 1.5 else COLOR_2
+            clr = COLOR_0 if r <= 0.8 else COLOR_1 if r <= 2.0 else COLOR_2
             h_cops[s].set_offsets([[xc, yc]])
             h_cops[s].set_facecolor(clr)
             h_cops[s].set_alpha(1.0)
