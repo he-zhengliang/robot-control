@@ -6,6 +6,7 @@ import numpy as np
 import serial
 import time
 import threading
+from collections import deque # <--- ADD THIS
 from geometry_msgs.msg import PointStamped, PoseStamped
 import moveit_commander
 from tf.transformations import quaternion_from_euler, quaternion_matrix
@@ -47,6 +48,7 @@ class TactileSystem:
     def __init__(self, port, baud):
         self.lock = threading.Lock()
         self.current_forces = np.zeros(CHANNELS)
+        self.buffer = deque(maxlen=10) # <--- ADD THIS (holds last 10 samples)
         self.grasp_prediction = "IDLE"
         
         self.Ro, self.Ri = 5.0, 2.0
@@ -84,6 +86,13 @@ class TactileSystem:
     def get_data(self):
         with self.lock:
             return self.current_forces.copy(), self.grasp_prediction
+
+    # ADD THIS NEW METHOD BELOW:
+    def get_smoothed_data(self):
+        with self.lock:
+            if len(self.buffer) == 0:
+                return self.current_forces.copy(), self.grasp_prediction
+            return np.mean(self.buffer, axis=0), self.grasp_prediction
 
     def set_prediction(self, status):
         with self.lock:
@@ -143,8 +152,14 @@ class ApplePicker:
             
             rospy.sleep(STABLE_SAMPLE_DELAY)
 
+            # CHANGE THIS LINE:
+            forces, _ = self.tactile.get_smoothed_data() # <--- Use smoothed data here
+            
+            if self.predict_status(forces):
+
             forces, _ = self.tactile.get_data()
             if self.predict_status(forces):
+
                 self.tactile.set_prediction("STABLE - DETACHING")
                 
                 # 3. Detach (Retract back to Approach point)
